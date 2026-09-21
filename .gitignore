@@ -1,0 +1,45 @@
+# Python environments and generated package metadata
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Python, test, lint, type-check, and coverage caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build, release, download, and temporary output
+build/
+dist/
+download/
+downloads/
+tmp/
+temp/
+*.tmp
+*.part
+*.log
+*.zip
+*.tar.gz
+*.whl
+
+# Local model, dataset, and media-processing artifacts
+data/
+models/
+logs/
+.hair_class_organizer_video_grabs/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Operating-system and editor metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
