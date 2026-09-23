@@ -1,6 +1,6 @@
 """Tk desktop interface for Hair Class Organizer."""
 
-import os
+import logging
 import queue
 import tkinter as tk
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -10,8 +10,10 @@ from threading import Event
 from tkinter import filedialog, ttk
 
 from app import __version__
-from app.config import APP_NAME, DATA_DIR, MODEL_ID, MODEL_LABELS, AppSettings
+from app.config import APP_NAME, LOG_PATH, MODEL_ID, MODEL_LABELS, MOVES_DIR, AppSettings
 from app.media import MediaResult, ScanOptions, move_media, plan_moves, scan_media
+
+logger = logging.getLogger(__name__)
 
 
 class MainView(ttk.Frame):
@@ -32,8 +34,11 @@ class MainView(ttk.Frame):
         self.confidence = tk.DoubleVar(master=self, value=settings.confidence)
         self.include_videos = tk.BooleanVar(master=self, value=settings.include_videos)
         self.frame_percentage = tk.IntVar(master=self, value=settings.frame_percentage)
+        self.video_workers = tk.IntVar(master=self, value=settings.video_workers)
+        self.move_workers = tk.IntVar(master=self, value=settings.move_workers)
         self.device = tk.StringVar(master=self, value=settings.device)
         self.status = tk.StringVar(master=self, value="Ready")
+        self.progress_metrics = tk.StringVar(master=self, value="0% (ETA --:--)")
         self.device_status = tk.StringVar(master=self, value="Device: not loaded")
         self.summary = tk.StringVar(master=self, value="0 media · 0 ready to move")
 
@@ -43,9 +48,10 @@ class MainView(ttk.Frame):
         self._build_source()
         self._build_options()
         self._build_actions()
-        self._build_results()
+        self._build_log()
         self._build_status()
         self.confidence.trace_add("write", self._refresh_move_plan)
+        self.log_after_id = self.after(250, self._tail_log)
 
     def _build_header(self) -> None:
         header = ttk.Frame(self)
@@ -70,7 +76,7 @@ class MainView(ttk.Frame):
     def _build_options(self) -> None:
         options = ttk.LabelFrame(self, text="Scan and move options", padding=10)
         options.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        options.columnconfigure(5, weight=1)
+        options.columnconfigure(9, weight=1)
 
         ttk.Label(options, text="Move confidence").grid(row=0, column=0, sticky="w")
         confidence = ttk.Spinbox(options, from_=0.0, to=1.0, increment=0.05, textvariable=self.confidence, width=7)
@@ -79,15 +85,21 @@ class MainView(ttk.Frame):
         ttk.Label(options, text="Video frame %").grid(row=0, column=3, sticky="w", padx=(20, 0))
         frame_position = ttk.Spinbox(options, from_=0, to=100, textvariable=self.frame_percentage, width=5)
         frame_position.grid(row=0, column=4, sticky="w", padx=(8, 20))
-        ttk.Label(options, text="Device").grid(row=0, column=5, sticky="e")
+        ttk.Label(options, text="Video workers").grid(row=0, column=5, sticky="w")
+        video_workers = ttk.Spinbox(options, from_=1, to=64, textvariable=self.video_workers, width=4)
+        video_workers.grid(row=0, column=6, sticky="w", padx=(8, 20))
+        ttk.Label(options, text="Move workers").grid(row=0, column=7, sticky="w")
+        move_workers = ttk.Spinbox(options, from_=1, to=64, textvariable=self.move_workers, width=4)
+        move_workers.grid(row=0, column=8, sticky="w", padx=(8, 20))
+        ttk.Label(options, text="Device").grid(row=0, column=9, sticky="e")
         device = ttk.Combobox(
             options, textvariable=self.device, values=("auto", "cpu", "cuda:0"), state="readonly", width=9
         )
-        device.grid(row=0, column=6, sticky="e", padx=(8, 0))
-        self.inputs.extend([confidence, frame_position, device])
+        device.grid(row=0, column=10, sticky="e", padx=(8, 0))
+        self.inputs.extend([confidence, frame_position, video_workers, move_workers, device])
 
         labels = ttk.Frame(options)
-        labels.grid(row=1, column=0, columnspan=7, sticky="w", pady=(10, 0))
+        labels.grid(row=1, column=0, columnspan=11, sticky="w", pady=(10, 0))
         ttk.Label(labels, text="Move classes:").pack(side="left")
         for label in MODEL_LABELS:
             variable = tk.BooleanVar(master=self, value=True)
@@ -106,30 +118,31 @@ class MainView(ttk.Frame):
         self.move_button.pack(side="left", padx=(8, 0))
         ttk.Label(actions, textvariable=self.summary).pack(side="right")
 
-    def _build_results(self) -> None:
-        table = ttk.Frame(self)
-        table.grid(row=4, column=0, sticky="nsew")
-        table.columnconfigure(0, weight=1)
-        table.rowconfigure(0, weight=1)
-        columns = ("source", "type", "label", "confidence", "status")
-        self.tree = ttk.Treeview(table, columns=columns, show="headings")
-        self.tree.heading("source", text="Source")
-        self.tree.heading("type", text="Type")
-        self.tree.heading("label", text="Hair color")
-        self.tree.heading("confidence", text="Confidence")
-        self.tree.heading("status", text="Status")
-        self.tree.column("source", minwidth=260, stretch=True)
-        self.tree.column("type", width=75, stretch=False)
-        self.tree.column("label", width=110, stretch=False)
-        self.tree.column("confidence", width=100, anchor="e", stretch=False)
-        self.tree.column("status", width=120, stretch=False)
-        vertical = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
+    def _build_log(self) -> None:
+        log = ttk.LabelFrame(self, text="Application log", padding=8)
+        log.grid(row=4, column=0, sticky="nsew")
+        log.columnconfigure(0, weight=1)
+        log.rowconfigure(0, weight=1)
+        self.log = tk.Text(log, wrap="none", state="disabled", font="TkFixedFont")
+        vertical = ttk.Scrollbar(log, orient="vertical", command=self.log.yview)
+        horizontal = ttk.Scrollbar(log, orient="horizontal", command=self.log.xview)
+        self.log.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.log.grid(row=0, column=0, sticky="nsew")
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
-        self.tree.bind("<Double-Button-1>", self._open_selected)
+        self.log_position = 0
+
+    def _tail_log(self) -> None:
+        with LOG_PATH.open("r", encoding="utf-8") as stream:
+            stream.seek(self.log_position)
+            content = stream.read()
+            self.log_position = stream.tell()
+        if content:
+            self.log.configure(state="normal")
+            self.log.insert("end", content)
+            self.log.see("end")
+            self.log.configure(state="disabled")
+        self.log_after_id = self.after(250, self._tail_log)
 
     def _build_status(self) -> None:
         status = ttk.Frame(self)
@@ -138,6 +151,7 @@ class MainView(ttk.Frame):
         ttk.Label(status, textvariable=self.status).grid(row=0, column=0, sticky="w")
         self.progress = ttk.Progressbar(status, mode="determinate", maximum=1)
         self.progress.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        ttk.Label(status, textvariable=self.progress_metrics).grid(row=0, column=2, sticky="e", padx=(8, 0))
 
     def _browse_folder(self) -> None:
         selection = filedialog.askdirectory(parent=self, initialdir=self.source.get() or None)
@@ -160,8 +174,9 @@ class MainView(ttk.Frame):
         self.results.clear()
         self.move_plan.clear()
         self.moved_paths.clear()
-        self.tree.delete(*self.tree.get_children())
         self.progress.configure(value=0, maximum=1)
+        self.progress_metrics.set("0% (ETA --:--)")
+        self.status.set("Preparing scan")
         self.stop.clear()
         self.operation = "scan"
         self._set_busy(True)
@@ -169,9 +184,11 @@ class MainView(ttk.Frame):
             source=Path(self.source.get()).resolve(),
             include_videos=self.include_videos.get(),
             frame_percentage=self.frame_percentage.get(),
+            video_workers=self.video_workers.get(),
             png_compress_level=self.settings.png_compress_level,
             device=self.device.get(),
         )
+        logger.info("Starting scan: %s", options)
         self.future = self.executor.submit(scan_media, options, self.stop, self.emit)
         self.after(75, self.poll)
 
@@ -180,12 +197,17 @@ class MainView(ttk.Frame):
         self.operation = "move"
         self._set_busy(True)
         self.progress.configure(value=0, maximum=len(self.move_plan))
-        self.status.set("Moving original media")
-        journal = DATA_DIR / "moves" / (datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f") + ".csv")
-        self.future = self.executor.submit(move_media, self.move_plan, journal, self.stop, self.emit)
+        self.progress_metrics.set("0% (ETA --:--)")
+        self.status.set("Moving media")
+        journal = MOVES_DIR / (datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f") + ".csv")
+        logger.info("Moving %d media", len(self.move_plan))
+        self.future = self.executor.submit(
+            move_media, self.move_plan, journal, self.stop, self.emit, self.move_workers.get()
+        )
         self.after(75, self.poll)
 
     def emit(self, kind: str, payload: object) -> None:
+        logger.info("%s: %s", kind, payload)
         self.events.put((kind, payload))
 
     def poll(self) -> None:
@@ -197,16 +219,24 @@ class MainView(ttk.Frame):
                 self.device_status.set(f"Device: {payload}")
             elif kind == "total":
                 self.progress.configure(maximum=max(int(payload), 1), value=0)
-            elif kind == "result":
-                self._add_result(payload)
-            elif kind == "progress":
-                completed, total, name = payload
+                self.progress_metrics.set("0% (ETA --:--)")
+            elif kind == "frame_progress":
+                completed, total, name, percentage, eta = payload
                 self.progress.configure(value=completed)
-                self.status.set(f"Scanning {completed}/{total}: {name}")
+                self.status.set(f"Extracting frames {completed}/{total}: {name}")
+                self.progress_metrics.set(f"{percentage}% (ETA {eta})")
+            elif kind == "progress":
+                completed, total, name, percentage, eta = payload
+                self.progress.configure(value=completed)
+                self.status.set(f"Scanning media {completed}/{total}: {name}")
+                self.progress_metrics.set(f"{percentage}% (ETA {eta})")
             elif kind == "moved":
                 self.moved_paths.add(payload.source)
-                self.progress.step()
-                self._render_result(payload)
+            elif kind == "move_progress":
+                completed, total, name, percentage, eta = payload
+                self.progress.configure(value=completed)
+                self.status.set(f"Moving media {completed}/{total}: {name}")
+                self.progress_metrics.set(f"{percentage}% (ETA {eta})")
 
         if not self.future.done():
             self.after(75, self.poll)
@@ -217,29 +247,13 @@ class MainView(ttk.Frame):
             self.results = outcome
             self._refresh_move_plan()
             self.status.set(f"Scan complete: {len(self.results)} media classified")
+            logger.info("Scan complete: %d media classified", len(self.results))
         else:
             self.results = [result for result in self.results if result.source not in self.moved_paths]
             self._refresh_move_plan()
             self.status.set(f"Move complete: {outcome} media moved")
+            logger.info("Move complete: %d media moved", outcome)
         self._set_busy(False)
-
-    def _add_result(self, result: MediaResult) -> None:
-        self.results.append(result)
-        self._render_result(result)
-
-    def _render_result(self, result: MediaResult) -> None:
-        item_id = str(result.source)
-        values = (
-            result.source.name,
-            result.media_type,
-            result.label,
-            f"{result.confidence:.1%}",
-            "Moved" if result.source in self.moved_paths else "Ready",
-        )
-        if self.tree.exists(item_id):
-            self.tree.item(item_id, values=values)
-        else:
-            self.tree.insert("", "end", iid=item_id, values=values)
 
     def _refresh_move_plan(self, *_: str) -> None:
         selected = {label for label, variable in self.label_vars.items() if variable.get()}
@@ -248,16 +262,13 @@ class MainView(ttk.Frame):
         if self.future is None or self.future.done():
             self.move_button.state(["!disabled"] if self.move_plan else ["disabled"])
 
-    def _open_selected(self, _event: tk.Event) -> None:
-        selection = self.tree.selection()
-        if selection:
-            os.startfile(Path(selection[0]).parent)
-
     def _save_settings(self) -> None:
         self.settings.source = self.source.get()
         self.settings.confidence = self.confidence.get()
         self.settings.include_videos = self.include_videos.get()
         self.settings.frame_percentage = self.frame_percentage.get()
+        self.settings.video_workers = self.video_workers.get()
+        self.settings.move_workers = self.move_workers.get()
         self.settings.device = self.device.get()
         self.settings.window_geometry = self.winfo_toplevel().geometry()
         self.settings.save()
@@ -265,6 +276,7 @@ class MainView(ttk.Frame):
     def close(self) -> None:
         self._save_settings()
         self.stop.set()
+        self.after_cancel(self.log_after_id)
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.winfo_toplevel().destroy()
 

@@ -1,17 +1,20 @@
 """Hair-color inference, Spectra-style video snapshots, and reviewed media moves."""
 
 import csv
+import multiprocessing
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from typing import Callable
 
 import cv2
 from PIL import Image
 
-from app.config import IMAGE_EXTENSIONS, MODEL_ID, MODEL_LABELS, VIDEO_EXTENSIONS, VIDEO_GRABS_FOLDER
+from app.config import IMAGE_EXTENSIONS, MODEL_ID, MODEL_LABELS, TEMP_DIR, VIDEO_EXTENSIONS
 
 Emit = Callable[[str, object], None]
 
@@ -21,6 +24,7 @@ class ScanOptions:
     source: Path
     include_videos: bool = True
     frame_percentage: int = 50
+    video_workers: int = 12
     png_compress_level: int = 1
     device: str = "auto"
 
@@ -66,6 +70,42 @@ def extract_video_frame(video_path: Path, image_path: Path, frame_percentage: in
     return frame_number
 
 
+def _extract_video_frame_task(task: tuple[Path, Path, int, int]) -> tuple[Path, Path, int]:
+    video_path, image_path, frame_percentage, png_compress_level = task
+    frame_number = extract_video_frame(video_path, image_path, frame_percentage, png_compress_level)
+    return video_path, image_path, frame_number
+
+
+def extract_video_frames(
+    videos: list[Path], grabs: Path, options: ScanOptions, stop: Event, emit: Emit
+) -> dict[Path, Path]:
+    grabs.mkdir(parents=True, exist_ok=True)
+    emit("total", len(videos))
+    tasks = [
+        (source, grabs / f"{source.name}.png", options.frame_percentage, options.png_compress_level)
+        for source in videos
+    ]
+    extracted_paths = {}
+    extraction_started = monotonic()
+    process_context = multiprocessing.get_context("spawn")
+    with process_context.Pool(processes=min(options.video_workers, len(videos))) as pool:
+        for source, inference_path, _frame_number in pool.imap_unordered(_extract_video_frame_task, tasks):
+            if stop.is_set():
+                break
+            extracted_paths[source] = inference_path
+            extracted = len(extracted_paths)
+            elapsed = monotonic() - extraction_started
+            eta_seconds = round(elapsed / extracted * (len(videos) - extracted))
+            eta = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
+            percentage = round(extracted / len(videos) * 100)
+            emit("frame_progress", (extracted, len(videos), source.name, percentage, eta))
+
+    if stop.is_set():
+        shutil.rmtree(grabs)
+        return {}
+    return extracted_paths
+
+
 def create_classifier(device: str):
     from transformers import pipeline
 
@@ -85,35 +125,54 @@ def create_classifier(device: str):
 def scan_media(options: ScanOptions, stop: Event, emit: Emit) -> list[MediaResult]:
     media = discover_media(options.source, options.include_videos)
     emit("total", len(media))
-    emit("status", f"Loading {MODEL_ID}")
-    classifier = create_classifier(options.device)
-    emit("device", str(classifier.device))
 
-    root = options.source if options.source.is_dir() else options.source.parent
     videos = [path for path in media if path.suffix.lower() in VIDEO_EXTENSIONS]
-    grabs = root / VIDEO_GRABS_FOLDER
-    if videos:
-        grabs.mkdir(exist_ok=True)
+    grabs = TEMP_DIR / "video-frames"
+    video_frames = extract_video_frames(videos, grabs, options, stop, emit) if videos else {}
+    if stop.is_set():
+        return []
 
-    results = []
-    for index, source in enumerate(media, 1):
+    sources = []
+    media_types = []
+    inference_paths = []
+    for source in media:
         if stop.is_set():
             break
         media_type = "video" if source.suffix.lower() in VIDEO_EXTENSIONS else "image"
-        inference_path = source
-        if media_type == "video":
-            inference_path = grabs / f"{source.name}.png"
-            frame_number = extract_video_frame(
-                source, inference_path, options.frame_percentage, options.png_compress_level
-            )
-            emit("status", f"Extracted frame {frame_number} from {source.name}")
+        inference_path = video_frames[source] if media_type == "video" else source
 
-        output = classifier(str(inference_path), top_k=len(MODEL_LABELS))
+        sources.append(source)
+        media_types.append(media_type)
+        inference_paths.append(str(inference_path))
+
+    if not inference_paths:
+        if videos:
+            shutil.rmtree(grabs)
+        return []
+
+    from transformers.pipelines.pt_utils import KeyDataset
+
+    dataset = KeyDataset([{"image": path} for path in inference_paths], "image")
+    emit("total", len(inference_paths))
+    emit("status", f"Loading {MODEL_ID}")
+    classifier = create_classifier(options.device)
+    emit("device", str(classifier.device))
+    outputs = classifier(dataset, batch_size=8, top_k=len(MODEL_LABELS))
+
+    results = []
+    classification_started = monotonic()
+    for index, (source, media_type, output) in enumerate(zip(sources, media_types, outputs), 1):
+        if stop.is_set():
+            break
         predictions = tuple((str(item["label"]), float(item["score"])) for item in output)
         result = MediaResult(source, media_type, predictions[0][0], predictions[0][1], predictions)
         results.append(result)
         emit("result", result)
-        emit("progress", (index, len(media), source.name))
+        elapsed = monotonic() - classification_started
+        eta_seconds = round(elapsed / index * (len(sources) - index))
+        eta = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
+        percentage = round(index / len(sources) * 100)
+        emit("progress", (index, len(sources), source.name, percentage, eta))
 
     if videos:
         shutil.rmtree(grabs)
@@ -131,27 +190,40 @@ def plan_moves(
     ]
 
 
-def move_media(results: list[MediaResult], journal: Path, stop: Event, emit: Emit) -> int:
+def _copy_media(result: MediaResult) -> MediaResult:
+    destination = result.destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with result.source.open("rb") as source_stream, destination.open("xb") as destination_stream:
+        shutil.copyfileobj(source_stream, destination_stream)
+        destination_stream.flush()
+        os.fsync(destination_stream.fileno())
+    shutil.copystat(result.source, destination)
+    return result
+
+
+def move_media(results: list[MediaResult], journal: Path, stop: Event, emit: Emit, workers: int = 12) -> int:
     journal.parent.mkdir(parents=True, exist_ok=True)
     moved = 0
+    move_started = monotonic()
     with journal.open("x", newline="", encoding="utf-8") as log:
         writer = csv.writer(log)
         writer.writerow(["source", "destination", "label", "confidence"])
         log.flush()
-        for result in results:
-            if stop.is_set():
-                break
-            destination = result.destination
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with result.source.open("rb") as source_stream, destination.open("xb") as destination_stream:
-                shutil.copyfileobj(source_stream, destination_stream)
-                destination_stream.flush()
-                os.fsync(destination_stream.fileno())
-            shutil.copystat(result.source, destination)
-            result.source.unlink()
-            writer.writerow([result.source, destination, result.label, result.confidence])
-            log.flush()
-            os.fsync(log.fileno())
-            moved += 1
-            emit("moved", result)
+        batches = (results[start : start + workers] for start in range(0, len(results), workers))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="media-move") as executor:
+            for batch in batches:
+                if stop.is_set():
+                    break
+                for result in executor.map(_copy_media, batch):
+                    result.source.unlink()
+                    writer.writerow([result.source, result.destination, result.label, result.confidence])
+                    log.flush()
+                    os.fsync(log.fileno())
+                    moved += 1
+                    emit("moved", result)
+                    elapsed = monotonic() - move_started
+                    eta_seconds = round(elapsed / moved * (len(results) - moved))
+                    eta = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
+                    percentage = round(moved / len(results) * 100)
+                    emit("move_progress", (moved, len(results), result.source.name, percentage, eta))
     return moved
