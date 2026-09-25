@@ -1,4 +1,4 @@
-"""Transformers-compatible wrapper for the published custom HairClassifier checkpoint."""
+"""timm adapter for the published HairClassifier checkpoint."""
 
 import json
 from pathlib import Path
@@ -7,10 +7,10 @@ import timm
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
-from transformers import AutoImageProcessor, PreTrainedModel, PretrainedConfig
+from transformers import AutoImageProcessor, PreTrainedModel, PretrainedConfig, pipeline
 from transformers.modeling_outputs import ImageClassifierOutput
 
-from app.config import MODEL_ID, MODEL_LABELS
+from app.config import DEFAULT_MODEL_ID
 
 WEIGHTS_FILENAME = "hair_color-convnext_tiny.fb_in22k.safetensors"
 CONFIG_FILENAME = "config.json"
@@ -41,14 +41,22 @@ class TimmWrapperForImageClassification(PreTrainedModel):
         return ImageClassifierOutput(logits=self.model(pixel_values))
 
 
-def load_pipeline_components():
-    config_path = hf_hub_download(MODEL_ID, CONFIG_FILENAME)
+def supports(model_id: str) -> bool:
+    return model_id == DEFAULT_MODEL_ID
+
+
+def create_pipeline(model_id: str, device: str):
+    config_path = hf_hub_download(model_id, CONFIG_FILENAME)
     config = HairColorConfig(**json.loads(Path(config_path).read_text(encoding="utf-8")))
-    config.id2label = {index: label for index, label in enumerate(MODEL_LABELS)}
-    config.label2id = {label: index for index, label in config.id2label.items()}
     model = TimmWrapperForImageClassification(config)
-    weights_path = hf_hub_download(MODEL_ID, WEIGHTS_FILENAME)
+    weights_path = hf_hub_download(model_id, WEIGHTS_FILENAME)
     model.load_state_dict(load_file(weights_path))
     model.eval()
-    image_processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-    return model, image_processor
+    arguments = {
+        "task": "image-classification",
+        "model": model,
+        "image_processor": AutoImageProcessor.from_pretrained(model_id),
+    }
+    if device != "auto":
+        arguments["device"] = device
+    return pipeline(**arguments)

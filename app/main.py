@@ -10,10 +10,16 @@ from threading import Event
 from tkinter import filedialog, ttk
 
 from app import __version__
-from app.config import APP_NAME, LOG_PATH, MODEL_ID, MODEL_LABELS, MOVES_DIR, AppSettings
+from app.config import APP_NAME, LOG_PATH, MOVES_DIR, AppSettings
 from app.media import MediaResult, ScanOptions, move_media, plan_moves, scan_media
 
 logger = logging.getLogger(__name__)
+
+
+def download_model(model_id: str) -> str:
+    from app.model_pipeline import download_model as download
+
+    return download(model_id)
 
 
 class MainView(ttk.Frame):
@@ -28,9 +34,10 @@ class MainView(ttk.Frame):
         self.results: list[MediaResult] = []
         self.move_plan: list[MediaResult] = []
         self.moved_paths: set[Path] = set()
-        self.label_vars: dict[str, tk.BooleanVar] = {}
+        self.inputs: list[ttk.Widget] = []
 
         self.source = tk.StringVar(master=self, value=settings.source)
+        self.model_id = tk.StringVar(master=self, value=settings.model_id)
         self.confidence = tk.DoubleVar(master=self, value=settings.confidence)
         self.include_videos = tk.BooleanVar(master=self, value=settings.include_videos)
         self.frame_percentage = tk.IntVar(master=self, value=settings.frame_percentage)
@@ -43,8 +50,19 @@ class MainView(ttk.Frame):
         self.summary = tk.StringVar(master=self, value="0 media · 0 ready to move")
 
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(4, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.panes = ttk.Panedwindow(self, orient="vertical")
+        self.panes.grid(row=0, column=0, sticky="nsew")
+        self.top_pane = ttk.Frame(self.panes)
+        self.top_pane.columnconfigure(0, weight=1)
+        self.top_pane.rowconfigure(3, weight=1)
+        self.bottom_pane = ttk.Frame(self.panes)
+        self.bottom_pane.columnconfigure(0, weight=1)
+        self.bottom_pane.rowconfigure(0, weight=1)
+        self.panes.add(self.top_pane, weight=3)
+        self.panes.add(self.bottom_pane, weight=2)
         self._build_header()
+        self._build_model()
         self._build_source()
         self._build_options()
         self._build_actions()
@@ -54,16 +72,26 @@ class MainView(ttk.Frame):
         self.log_after_id = self.after(250, self._tail_log)
 
     def _build_header(self) -> None:
-        header = ttk.Frame(self)
+        header = ttk.Frame(self.top_pane)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text=f"{APP_NAME} v{__version__}", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text=MODEL_ID).grid(row=1, column=0, sticky="w")
-        ttk.Label(header, textvariable=self.device_status).grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Label(header, textvariable=self.device_status).grid(row=0, column=1, sticky="e")
+
+    def _build_model(self) -> None:
+        model = ttk.LabelFrame(self.top_pane, text="Model", padding=10)
+        model.grid(row=1, column=0, sticky="ew")
+        model.columnconfigure(1, weight=1)
+        ttk.Label(model, text="Repo ID").grid(row=0, column=0, sticky="w")
+        model_entry = ttk.Entry(model, textvariable=self.model_id)
+        model_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        download_button = ttk.Button(model, text="Download", command=self.start_download)
+        download_button.grid(row=0, column=2, padx=(8, 0))
+        self.inputs.extend([model_entry, download_button])
 
     def _build_source(self) -> None:
-        source_frame = ttk.LabelFrame(self, text="Media source", padding=10)
-        source_frame.grid(row=1, column=0, sticky="ew")
+        source_frame = ttk.LabelFrame(self.top_pane, text="Media source", padding=10)
+        source_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         source_frame.columnconfigure(0, weight=1)
         self.source_entry = ttk.Entry(source_frame, textvariable=self.source)
         self.source_entry.grid(row=0, column=0, sticky="ew")
@@ -71,12 +99,13 @@ class MainView(ttk.Frame):
         folder_button.grid(row=0, column=1, padx=(8, 0))
         file_button = ttk.Button(source_frame, text="Browse file…", command=self._browse_file)
         file_button.grid(row=0, column=2, padx=(8, 0))
-        self.inputs = [self.source_entry, folder_button, file_button]
+        self.inputs.extend([self.source_entry, folder_button, file_button])
 
     def _build_options(self) -> None:
-        options = ttk.LabelFrame(self, text="Scan and move options", padding=10)
-        options.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        options = ttk.LabelFrame(self.top_pane, text="Scan and move options", padding=10)
+        options.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         options.columnconfigure(9, weight=1)
+        options.rowconfigure(1, weight=1)
 
         ttk.Label(options, text="Move confidence").grid(row=0, column=0, sticky="w")
         confidence = ttk.Spinbox(options, from_=0.0, to=1.0, increment=0.05, textvariable=self.confidence, width=7)
@@ -98,18 +127,21 @@ class MainView(ttk.Frame):
         device.grid(row=0, column=10, sticky="e", padx=(8, 0))
         self.inputs.extend([confidence, frame_position, video_workers, move_workers, device])
 
-        labels = ttk.Frame(options)
-        labels.grid(row=1, column=0, columnspan=11, sticky="w", pady=(10, 0))
-        ttk.Label(labels, text="Move classes:").pack(side="left")
-        for label in MODEL_LABELS:
-            variable = tk.BooleanVar(master=self, value=True)
-            variable.trace_add("write", self._refresh_move_plan)
-            self.label_vars[label] = variable
-            ttk.Checkbutton(labels, text=label, variable=variable).pack(side="left", padx=(8, 0))
+        ttk.Label(options, text="Move classes").grid(row=1, column=0, sticky="nw", pady=(10, 0))
+        label_frame = ttk.Frame(options)
+        label_frame.grid(row=1, column=1, columnspan=10, sticky="nsew", pady=(10, 0))
+        label_frame.columnconfigure(0, weight=1)
+        label_frame.rowconfigure(0, weight=1)
+        self.label_list = tk.Listbox(label_frame, selectmode="extended", exportselection=False, height=8)
+        label_scrollbar = ttk.Scrollbar(label_frame, orient="vertical", command=self.label_list.yview)
+        self.label_list.configure(yscrollcommand=label_scrollbar.set)
+        self.label_list.grid(row=0, column=0, sticky="nsew")
+        label_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.label_list.bind("<<ListboxSelect>>", self._refresh_move_plan)
 
     def _build_actions(self) -> None:
-        actions = ttk.Frame(self)
-        actions.grid(row=3, column=0, sticky="ew", pady=10)
+        actions = ttk.Frame(self.top_pane)
+        actions.grid(row=4, column=0, sticky="ew", pady=10)
         self.scan_button = ttk.Button(actions, text="Scan media", command=self.start_scan)
         self.scan_button.pack(side="left")
         self.stop_button = ttk.Button(actions, text="Stop", command=self.stop.set, state="disabled")
@@ -119,11 +151,11 @@ class MainView(ttk.Frame):
         ttk.Label(actions, textvariable=self.summary).pack(side="right")
 
     def _build_log(self) -> None:
-        log = ttk.LabelFrame(self, text="Application log", padding=8)
-        log.grid(row=4, column=0, sticky="nsew")
+        log = ttk.LabelFrame(self.bottom_pane, text="Application log", padding=8)
+        log.grid(row=0, column=0, sticky="nsew")
         log.columnconfigure(0, weight=1)
         log.rowconfigure(0, weight=1)
-        self.log = tk.Text(log, wrap="none", state="disabled", font="TkFixedFont")
+        self.log = tk.Text(log, wrap="none", state="disabled", font="TkFixedFont", height=8)
         vertical = ttk.Scrollbar(log, orient="vertical", command=self.log.yview)
         horizontal = ttk.Scrollbar(log, orient="horizontal", command=self.log.xview)
         self.log.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
@@ -145,8 +177,8 @@ class MainView(ttk.Frame):
         self.log_after_id = self.after(250, self._tail_log)
 
     def _build_status(self) -> None:
-        status = ttk.Frame(self)
-        status.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        status = ttk.Frame(self.bottom_pane)
+        status.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         status.columnconfigure(0, weight=1)
         ttk.Label(status, textvariable=self.status).grid(row=0, column=0, sticky="w")
         self.progress = ttk.Progressbar(status, mode="determinate", maximum=1)
@@ -166,14 +198,24 @@ class MainView(ttk.Frame):
     def _set_busy(self, busy: bool) -> None:
         for widget in self.inputs + [self.scan_button]:
             widget.state(["disabled"] if busy else ["!disabled"])
-        self.stop_button.state(["!disabled"] if busy else ["disabled"])
+        self.stop_button.state(["!disabled"] if busy and self.operation != "download" else ["disabled"])
         self.move_button.state(["disabled"] if busy or not self.move_plan else ["!disabled"])
+
+    def start_download(self) -> None:
+        self._save_settings()
+        self.operation = "download"
+        self._set_busy(True)
+        self.status.set(f"Downloading {self.model_id.get()}")
+        logger.info("Downloading model: %s", self.model_id.get())
+        self.future = self.executor.submit(download_model, self.model_id.get())
+        self.after(75, self.poll)
 
     def start_scan(self) -> None:
         self._save_settings()
         self.results.clear()
         self.move_plan.clear()
         self.moved_paths.clear()
+        self._set_labels(())
         self.progress.configure(value=0, maximum=1)
         self.progress_metrics.set("0% (ETA --:--)")
         self.status.set("Preparing scan")
@@ -182,6 +224,7 @@ class MainView(ttk.Frame):
         self._set_busy(True)
         options = ScanOptions(
             source=Path(self.source.get()).resolve(),
+            model_id=self.model_id.get(),
             include_videos=self.include_videos.get(),
             frame_percentage=self.frame_percentage.get(),
             video_workers=self.video_workers.get(),
@@ -217,6 +260,8 @@ class MainView(ttk.Frame):
                 self.status.set(str(payload))
             elif kind == "device":
                 self.device_status.set(f"Device: {payload}")
+            elif kind == "labels":
+                self._set_labels(payload)
             elif kind == "total":
                 self.progress.configure(maximum=max(int(payload), 1), value=0)
                 self.progress_metrics.set("0% (ETA --:--)")
@@ -248,22 +293,32 @@ class MainView(ttk.Frame):
             self._refresh_move_plan()
             self.status.set(f"Scan complete: {len(self.results)} media classified")
             logger.info("Scan complete: %d media classified", len(self.results))
-        else:
+        elif self.operation == "move":
             self.results = [result for result in self.results if result.source not in self.moved_paths]
             self._refresh_move_plan()
             self.status.set(f"Move complete: {outcome} media moved")
             logger.info("Move complete: %d media moved", outcome)
+        else:
+            self.status.set(f"Downloaded {self.model_id.get()}")
+            logger.info("Model downloaded: %s", outcome)
         self._set_busy(False)
 
     def _refresh_move_plan(self, *_: str) -> None:
-        selected = {label for label, variable in self.label_vars.items() if variable.get()}
+        selected = {self.label_list.get(index) for index in self.label_list.curselection()}
         self.move_plan = plan_moves(self.results, Path(self.source.get()).resolve(), selected, self.confidence.get())
         self.summary.set(f"{len(self.results)} media · {len(self.move_plan)} ready to move")
         if self.future is None or self.future.done():
             self.move_button.state(["!disabled"] if self.move_plan else ["disabled"])
 
+    def _set_labels(self, labels) -> None:
+        self.label_list.delete(0, "end")
+        for label in labels:
+            self.label_list.insert("end", label)
+        self.label_list.selection_set(0, "end")
+
     def _save_settings(self) -> None:
         self.settings.source = self.source.get()
+        self.settings.model_id = self.model_id.get()
         self.settings.confidence = self.confidence.get()
         self.settings.include_videos = self.include_videos.get()
         self.settings.frame_percentage = self.frame_percentage.get()

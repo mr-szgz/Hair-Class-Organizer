@@ -14,7 +14,7 @@ from typing import Callable
 import cv2
 from PIL import Image
 
-from app.config import IMAGE_EXTENSIONS, MODEL_ID, MODEL_LABELS, TEMP_DIR, VIDEO_EXTENSIONS
+from app.config import DEFAULT_MODEL_ID, IMAGE_EXTENSIONS, TEMP_DIR, VIDEO_EXTENSIONS
 
 Emit = Callable[[str, object], None]
 
@@ -22,6 +22,7 @@ Emit = Callable[[str, object], None]
 @dataclass(frozen=True, slots=True)
 class ScanOptions:
     source: Path
+    model_id: str = DEFAULT_MODEL_ID
     include_videos: bool = True
     frame_percentage: int = 50
     video_workers: int = 12
@@ -106,20 +107,19 @@ def extract_video_frames(
     return extracted_paths
 
 
-def create_classifier(device: str):
-    from transformers import pipeline
+def create_classifier(model_id: str, device: str):
+    from app.model_pipeline import create_model_pipeline
 
-    from app.model import load_pipeline_components
+    return create_model_pipeline(model_id, device)
 
-    model, image_processor = load_pipeline_components()
-    arguments = {
-        "task": "image-classification",
-        "model": model,
-        "image_processor": image_processor,
-    }
-    if device != "auto":
-        arguments["device"] = device
-    return pipeline(**arguments)
+
+def normalize_predictions(output: list[dict[str, object]]) -> tuple[tuple[str, float], ...]:
+    scores: dict[str, float] = {}
+    for item in output:
+        label = str(item["label"])
+        score = float(item["score"])
+        scores[label] = max(score, scores.get(label, 0.0))
+    return tuple(sorted(scores.items(), key=lambda item: item[1], reverse=True))
 
 
 def scan_media(options: ScanOptions, stop: Event, emit: Emit) -> list[MediaResult]:
@@ -150,21 +150,20 @@ def scan_media(options: ScanOptions, stop: Event, emit: Emit) -> list[MediaResul
             shutil.rmtree(grabs)
         return []
 
-    from transformers.pipelines.pt_utils import KeyDataset
-
-    dataset = KeyDataset([{"image": path} for path in inference_paths], "image")
     emit("total", len(inference_paths))
-    emit("status", f"Loading {MODEL_ID}")
-    classifier = create_classifier(options.device)
+    emit("status", f"Loading {options.model_id}")
+    classifier = create_classifier(options.model_id, options.device)
     emit("device", str(classifier.device))
-    outputs = classifier(dataset, batch_size=8, top_k=len(MODEL_LABELS))
+    emit("labels", classifier.labels)
+    emit("status", "Scanning media")
+    outputs = classifier.predict(inference_paths, batch_size=8)
 
     results = []
     classification_started = monotonic()
     for index, (source, media_type, output) in enumerate(zip(sources, media_types, outputs), 1):
         if stop.is_set():
             break
-        predictions = tuple((str(item["label"]), float(item["score"])) for item in output)
+        predictions = normalize_predictions(output)
         result = MediaResult(source, media_type, predictions[0][0], predictions[0][1], predictions)
         results.append(result)
         emit("result", result)

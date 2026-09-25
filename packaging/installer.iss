@@ -25,6 +25,7 @@ SetupLogging=yes
 Source: "..\build\bootstrap\uv\uv.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "..\build\bootstrap\LICENSE-*"; DestDir: "{app}\tools\licenses"; Flags: ignoreversion
 Source: "..\app\*.py"; DestDir: "{app}\app\app"; Flags: ignoreversion
+Source: "..\app\models\*.py"; DestDir: "{app}\app\app\models"; Flags: ignoreversion
 Source: "..\pyproject.toml"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "..\uv.lock"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}\app"; Flags: ignoreversion

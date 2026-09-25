@@ -8,8 +8,7 @@ from dataclasses import asdict, dataclass
 from platformdirs import user_config_path
 
 APP_NAME = "Hair Class Organizer"
-MODEL_ID = "electblake/hair_color_classifier"
-MODEL_LABELS = ("black", "blonde", "blue", "brown", "pink", "red", "silver")
+DEFAULT_MODEL_ID = "electblake/hair_color_classifier"
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".avi", ".gif", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
@@ -26,6 +25,7 @@ LOG_PATH = APP_STATE_DIR / "hair-class-organizer.log"
 @dataclass(slots=True)
 class AppSettings:
     source: str = ""
+    model_id: str = DEFAULT_MODEL_ID
     confidence: float = 0.5
     include_videos: bool = True
     frame_percentage: int = 50

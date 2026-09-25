@@ -31,6 +31,8 @@ temp/
 # Local model, dataset, and media-processing artifacts
 data/
 models/
+!app/models/
+!app/models/*.py
 logs/
 .hair_class_organizer_video_grabs/
 *.onnx

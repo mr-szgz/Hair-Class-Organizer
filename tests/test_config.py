@@ -1,6 +1,16 @@
 from platformdirs import user_config_path
 
-from app.config import APP_STATE_DIR, CACHE_DIR, CONFIG_PATH, HF_CACHE_DIR, LOG_PATH, MOVES_DIR, TEMP_DIR, AppSettings
+from app.config import (
+    APP_STATE_DIR,
+    CACHE_DIR,
+    CONFIG_PATH,
+    DEFAULT_MODEL_ID,
+    HF_CACHE_DIR,
+    LOG_PATH,
+    MOVES_DIR,
+    TEMP_DIR,
+    AppSettings,
+)
 
 
 def test_app_owned_paths_share_user_config_root():
@@ -12,3 +22,7 @@ def test_app_owned_paths_share_user_config_root():
 def test_default_worker_counts_are_optimized_for_parallel_media_operations():
     assert AppSettings().video_workers == 12
     assert AppSettings().move_workers == 12
+
+
+def test_default_model_is_the_published_hair_classifier():
+    assert AppSettings().model_id == DEFAULT_MODEL_ID == "electblake/hair_color_classifier"

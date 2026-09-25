@@ -14,6 +14,7 @@ from app.media import (
     extract_video_frame,
     extract_video_frames,
     move_media,
+    normalize_predictions,
     plan_moves,
     scan_media,
 )
@@ -89,20 +90,17 @@ def test_pipeline_predictions_are_assigned_to_original_video(tmp_path: Path, mon
     writer.release()
     inputs = []
 
-    def classifier(dataset, batch_size, top_k):
-        inputs.extend(Path(path) for path in dataset)
-        assert batch_size == 8
-        assert top_k == 7
-        return iter([[{"label": "black", "score": 0.9}, {"label": "brown", "score": 0.1}]])
-
     class FakeClassifier:
         device = "cpu"
+        labels = ("black", "brown")
 
-        def __call__(self, dataset, batch_size, top_k):
-            return classifier(dataset, batch_size, top_k)
+        def predict(self, paths, batch_size):
+            inputs.extend(Path(path) for path in paths)
+            assert batch_size == 8
+            return iter([[{"label": "black", "score": 0.9}, {"label": "brown", "score": 0.1}]])
 
     fake = FakeClassifier()
-    monkeypatch.setattr(media, "create_classifier", lambda _device: fake)
+    monkeypatch.setattr(media, "create_classifier", lambda _model_id, _device: fake)
     events = []
     result = scan_media(ScanOptions(tmp_path), Event(), lambda *event: events.append(event))[0]
     assert result.source == video_path
@@ -112,8 +110,19 @@ def test_pipeline_predictions_are_assigned_to_original_video(tmp_path: Path, mon
     assert not inputs[0].parent.exists()
     assert not (tmp_path / ".hair_class_organizer_video_grabs").exists()
     assert ("device", "cpu") in events
+    assert ("labels", ("black", "brown")) in events
+    assert ("status", "Scanning media") in events
     assert ("frame_progress", (1, 1, "clip.avi", 100, "00:00")) in events
     assert ("progress", (1, 1, "clip.avi", 100, "00:00")) in events
+
+
+def test_detection_predictions_keep_the_highest_score_per_label():
+    output = [
+        {"label": "brown", "score": 0.7, "box": {}},
+        {"label": "black", "score": 0.8, "box": {}},
+        {"label": "brown", "score": 0.9, "box": {}},
+    ]
+    assert normalize_predictions(output) == (("brown", 0.9), ("black", 0.8))
 
 
 def test_planned_moves_use_labels_confidence_and_do_not_overwrite(tmp_path: Path):
